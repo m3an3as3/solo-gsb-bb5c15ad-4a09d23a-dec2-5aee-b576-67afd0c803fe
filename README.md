@@ -34,6 +34,84 @@ API 等待数据库健康检查后启动，并在启动时自动核对/初始化
   `unhealthy`，启动日志（`docker compose logs api`）也会输出同样的缺失清单。
   此时需要由运维按新版本迁移/修正数据库结构后再启动，服务不会静默改写半旧库。
 
+## 只读完整性巡检（`python -m app.integrity_audit`）
+
+服务镜像内置只读巡检命令，用于离线核对持久化数据与承诺哈希方案、结算固化
+计数是否一致。巡检复用服务的 `DATABASE_URL` 连接配置（`app/database.py`）
+与承诺哈希算法（`app/hashing.py`），在**同一 PostgreSQL 一致性只读快照**
+（单条 `REPEATABLE READ READ ONLY` 事务）中逐事件核对，只执行 SELECT、
+事务以回滚结束，**全程不改写任何业务数据**：
+
+- **揭示核对**：每条揭示关联的承诺必须存在且属于该事件；用揭示保存的
+  原文与盐按承诺哈希方案重算，重算值须同时等于揭示保存的
+  `recomputed_hash` 与承诺的 `commitment_hash`；
+- **结算核对**：已结算事件按标准结果重算正确 / 错误 / 未揭示数（与结算
+  写入时同一统计口径：揭示原文与标准结果逐字符精确匹配），与固化计数
+  逐项比较。
+
+### 容器内巡检用法
+
+Compose 一键启动（`docker compose up --build`）后，在 API 容器中执行：
+
+```bash
+docker compose exec api python -m app.integrity_audit           # 单行 JSON 报告
+docker compose exec api python -m app.integrity_audit --pretty  # 缩进 JSON 报告
+echo $?                                                          # 0=无异常，1=有异常
+```
+
+本地直跑（需自行提供 `DATABASE_URL`）：
+
+```bash
+DATABASE_URL=postgresql+psycopg2://postgres:postgres@localhost:5432/predictions \
+  python -m app.integrity_audit
+```
+
+### 报告格式与退出码
+
+报告为机器可读 JSON（stdout）：`status`（`ok` / `anomalies`）、
+`generated_at`、`hash_scheme`、`snapshot`（PostgreSQL 上为
+`REPEATABLE READ READ ONLY`）、`checked`（各表核对的记录数）、
+`anomaly_count` 与 `anomalies`。每条异常给出稳定问题代码 `code`、所属
+`event_id`、异常记录 ID（`reveal_id` / `commitment_id` / `settlement_id`）
+及存库值与重算值：
+
+```json
+{
+  "status": "anomalies",
+  "generated_at": "2030-01-03T00:00:00+00:00",
+  "hash_scheme": "sha256(u64be(len(utf8(text))) || utf8(text) || utf8(salt))",
+  "snapshot": "REPEATABLE READ READ ONLY",
+  "checked": {"events": 1, "commitments": 3, "reveals": 2, "settlements": 1},
+  "anomaly_count": 1,
+  "anomalies": [
+    {
+      "code": "SETTLEMENT_UNREVEALED_COUNT_MISMATCH",
+      "event_id": "<EVENT_ID>",
+      "settlement_id": "<SETTLEMENT_ID>",
+      "stored_count": 0,
+      "recounted_count": 1,
+      "message": "结算固化的未揭示数与按标准结果重算的值不一致"
+    }
+  ]
+}
+```
+
+稳定问题代码：
+
+| code | 含义 |
+|------|------|
+| `REVEAL_COMMITMENT_MISSING` | 揭示关联的承诺不存在 |
+| `REVEAL_COMMITMENT_EVENT_MISMATCH` | 揭示关联的承诺属于其他事件 |
+| `REVEAL_RECOMPUTED_HASH_MISMATCH` | 原文与盐重算值不等于揭示保存的 `recomputed_hash` |
+| `REVEAL_COMMITMENT_HASH_MISMATCH` | 原文与盐重算值不等于承诺的 `commitment_hash` |
+| `SETTLEMENT_CORRECT_COUNT_MISMATCH` | 结算固化的正确数与重算值不一致 |
+| `SETTLEMENT_INCORRECT_COUNT_MISMATCH` | 结算固化的错误数与重算值不一致 |
+| `SETTLEMENT_UNREVEALED_COUNT_MISMATCH` | 结算固化的未揭示数与重算值不一致 |
+
+退出码：`0` 无异常；`1` 发现异常（报告仍输出到 stdout）；`2` 巡检自身
+执行失败（如数据库不可达，错误 JSON 输出到 stderr）。巡检只报告不修复，
+可直接对接监控告警（退出码非 0 即告警）。
+
 ## 承诺哈希方案
 
 ```
@@ -1133,6 +1211,7 @@ app/
   schema_bootstrap.py # 启动期库结构核对：空库建表；已有库逐表核对必需表/列，缺项只报告不补建
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
+  integrity_audit.py # 只读完整性巡检命令（python -m app.integrity_audit）：同一一致性只读快照中核对揭示哈希与结算固化计数
   merkle.py     # 承诺集合 Merkle 树：叶/内部域前缀、末项复制、成员证明与严格校验（纯函数）
   intervals.py  # 数值区间预测报告：有限十进制解析、精确覆盖判定与命中排名（纯函数）
   calibration.py # 跨事件概率校准报告：[0,1] 概率严格解析、Decimal Brier 均分与十分箱汇总（纯函数）
@@ -1154,6 +1233,7 @@ tests/test_interval_report.py # 数值区间报告：十进制精确覆盖判定
 tests/test_calibration_report.py # 跨事件概率校准：严格概率解析、Brier 均分、十分箱边界与五成双量化
 tests/test_merkle.py          # Merkle 纯函数：空根/单叶、末项复制、域分离、成员证明与严格层级校验
 tests/test_merkle_proofs_api.py  # 集合证明 API：阶段门禁、根/证明签发、本地校验、404/409 与现有流程不受影响
+tests/test_integrity_audit.py # 只读完整性巡检：揭示/结算核对、稳定问题代码、退出码、只读保证与子进程端到端
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
