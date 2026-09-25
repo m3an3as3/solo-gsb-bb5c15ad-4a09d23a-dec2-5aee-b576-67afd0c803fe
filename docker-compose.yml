@@ -32,5 +32,18 @@ services:
       retries: 20
       start_period: 10s
 
+  # 只读完整性巡检（一次性任务，不参与默认启动）：复用同一镜像与数据库连接，
+  # 在同一 PostgreSQL 一致性只读快照内核对揭示哈希与结算计数，输出 JSON。
+  # 用法：docker compose run --rm audit [--pretty]（退出码 0 无异常 / 1 有异常）
+  audit:
+    build: .
+    profiles: ["audit"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/predictions
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "app.integrity_audit"]
+
 volumes:
   pgdata:

@@ -1031,6 +1031,86 @@ curl -s -X POST http://localhost:8000/events/probability-calibration-report \
 
 > 上例 `bins` 仅展示前 3 箱；实际响应始终包含全部 10 箱（`index` 0～9）。
 
+## 只读数据完整性巡检（`python -m app.integrity_audit`）
+
+随服务镜像交付的只读巡检命令，供运维核对持久库中「承诺 → 揭示 → 结算」
+链条的内部一致性。命令复用服务的数据库连接配置（`DATABASE_URL`）与承诺
+哈希算法（`app.hashing.compute_commitment`），在**同一个只读事务**中完成
+全部核对，**不改写任何业务数据**（不执行任何 INSERT / UPDATE / DELETE /
+DDL，也不做启动期建表）：
+
+- **PostgreSQL**（Compose 环境）：整个巡检在单个 `REPEATABLE READ` +
+  `READ ONLY` 事务中进行——自首个语句起看到同一份一致性快照，巡检期间
+  其它事务的写入不会混入；事务级 `READ ONLY` 由数据库强制本事务不可写；
+- **核对内容**（逐事件）：
+  1. 每条揭示关联的承诺必须**存在且属于该事件**；
+  2. 用揭示保存的原文与盐按约定方案重算，结果须**同时**等于揭示保存的
+     `recomputed_hash` 与关联承诺的 `commitment_hash`；
+  3. 已结算事件按标准结果重算 正确 / 错误 / 未揭示 三个计数，与结算时
+     固化的计数**逐项比较**（揭示数据被事后改动时，重算计数与固化计数
+     的偏差会一并报出）。
+
+### 启动与容器内巡检用法
+
+```bash
+docker compose up --build -d        # 一键启动（db + api，与既有用法一致）
+
+# 在运行中的 api 容器内执行巡检（镜像已自带该命令）
+docker compose exec api python -m app.integrity_audit
+docker compose exec api python -m app.integrity_audit --pretty   # 缩进格式
+
+# 或不依赖 api 容器：用同一镜像跑一次性巡检容器（profiles=audit，不参与默认启动）
+docker compose run --rm audit
+# 旧版 Compose 若要求显式启用 profile：docker compose --profile audit run --rm audit
+```
+
+本地直跑（非容器）同样可用：`DATABASE_URL=... python3 -m app.integrity_audit`。
+
+### 输出与退出码
+
+stdout 输出**单个机器可读 JSON**（巡检本身失败时错误摘要只写 stderr，
+不输出半截 JSON）：
+
+```json
+{
+  "status": "anomalies_found",
+  "generated_at": "2030-01-03T00:00:00+00:00",
+  "hash_scheme": "sha256(u64be(len(utf8(text))) || utf8(text) || utf8(salt))",
+  "snapshot": {"isolation_level": "REPEATABLE READ", "postgresql_readonly": true},
+  "summary": {"event_count": 3, "commitment_count": 9, "reveal_count": 6,
+              "settlement_count": 2, "anomaly_count": 1},
+  "anomalies": [
+    {"code": "REVEAL_HASH_MISMATCH", "event_id": "<EVENT_ID>",
+     "record_type": "reveal", "record_id": "<REVEAL_ID>",
+     "detail": {"commitment_id": "<COMMITMENT_ID>",
+                "stored_hash": "…", "recomputed_hash": "…"}}
+  ]
+}
+```
+
+无异常时 `status` 为 `"ok"`、`anomaly_count` 为 0、`anomalies` 为空数组。
+
+- `snapshot` 回显本次巡检使用的事务快照选项（PostgreSQL 为只读可重复读；
+  其它方言为 `null`）；
+- `anomalies` 逐条给出**事件 ID、异常记录类型与记录 ID、稳定的问题代码**
+  及比对细节，按 `(code, event_id, record_id)` 稳定排序，相同数据重复
+  巡检输出一致；
+- **退出码**：`0` 巡检完成且无异常；`1` 巡检完成但发现异常（明细见
+  `anomalies`）；`2` 巡检未能完成（数据库不可达、库结构缺失等）。
+
+稳定的问题代码（对外契约，只增不改）：
+
+| code | 含义 |
+|------|------|
+| `REVEAL_COMMITMENT_NOT_FOUND` | 揭示关联的承诺不存在（悬挂引用） |
+| `REVEAL_COMMITMENT_EVENT_MISMATCH` | 揭示关联的承诺属于其他事件 |
+| `REVEAL_HASH_MISMATCH` | 原文 + 盐重算值 ≠ 揭示保存的 `recomputed_hash` |
+| `REVEAL_COMMITMENT_HASH_MISMATCH` | 原文 + 盐重算值 ≠ 承诺的 `commitment_hash` |
+| `SETTLEMENT_EVENT_NOT_FOUND` | 结算记录所属的事件不存在（悬挂引用） |
+| `SETTLEMENT_CORRECT_COUNT_MISMATCH` | 重算正确数 ≠ 固化的 `correct_count` |
+| `SETTLEMENT_INCORRECT_COUNT_MISMATCH` | 重算错误数 ≠ 固化的 `incorrect_count` |
+| `SETTLEMENT_UNREVEALED_COUNT_MISMATCH` | 重算未揭示数 ≠ 固化的 `unrevealed_count` |
+
 ## 错误响应
 
 错误统一返回 `{"detail": {"code": "...", "message": "..."}}`，且**均不改变任何状态**
@@ -1097,6 +1177,9 @@ Compose 编排说明（见 `docker-compose.yml`）：
 - API 通过环境变量 `DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/predictions`
   连接数据库；如本机 5432 或 8000 端口被占用，可在 `docker-compose.yml`
   中修改 `ports` 映射（容器内端口不变）。
+- **audit**（profiles=`audit`，不参与默认启动）：与 api 同一镜像的一次性
+  只读巡检任务，`docker compose run --rm audit` 即可在只读一致性快照内
+  核对全库并输出 JSON（详见上文「只读数据完整性巡检」）。
 
 启动后即可访问：
 
@@ -1136,6 +1219,7 @@ app/
   merkle.py     # 承诺集合 Merkle 树：叶/内部域前缀、末项复制、成员证明与严格校验（纯函数）
   intervals.py  # 数值区间预测报告：有限十进制解析、精确覆盖判定与命中排名（纯函数）
   calibration.py # 跨事件概率校准报告：[0,1] 概率严格解析、Decimal Brier 均分与十分箱汇总（纯函数）
+  integrity_audit.py # 只读完整性巡检命令（python -m app.integrity_audit）：同一只读快照内核对揭示哈希与结算计数，输出 JSON
   database.py   # 引擎与会话（DATABASE_URL 可配置）
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
 tests/test_request_timestamp.py # 准入判定与 created_at 共用同一请求时刻：跨截止点不串阶段、批量共用时刻、拒绝不落库
@@ -1154,6 +1238,7 @@ tests/test_interval_report.py # 数值区间报告：十进制精确覆盖判定
 tests/test_calibration_report.py # 跨事件概率校准：严格概率解析、Brier 均分、十分箱边界与五成双量化
 tests/test_merkle.py          # Merkle 纯函数：空根/单叶、末项复制、域分离、成员证明与严格层级校验
 tests/test_merkle_proofs_api.py  # 集合证明 API：阶段门禁、根/证明签发、本地校验、404/409 与现有流程不受影响
+tests/test_integrity_audit.py   # 只读巡检：干净库退出 0、揭示哈希/归属异常、结算计数偏差、悬挂引用、只读性与失败退出码
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
